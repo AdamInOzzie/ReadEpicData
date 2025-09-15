@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Terms and Conditions — ReadEpicData Demo</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, Segoe UI, Roboto, Helvetica, Arial, sans-serif; line-height: 1.6; margin: 2rem auto; max-width: 800px; padding: 0 1rem; color: #222; }
+    h1, h2, h3 { line-height: 1.25; }
+    code { background: #f4f4f4; padding: 0.1rem 0.3rem; border-radius: 4px; }
+    .meta { color: #666; font-size: .9rem; }
+  </style>
+</head>
+<body>
+  <h1>Terms and Conditions</h1>
+  <p class="meta">For: ReadEpicData (SMART on FHIR demo app)<br/>Last updated: 2025-09-16</p>
+
+  <h2>Purpose</h2>
+  <p>This application is a personal, non-commercial demonstration for accessing your own health records from Epic/MyChart via SMART on FHIR (FHIR R4). It is intended for testing and educational use only.</p>
+
+  <h2>Data Access and Storage</h2>
+  <ul>
+    <li>The app requests read-only access to your data using the scopes: <code>openid</code>, <code>fhirUser</code>, <code>launch/patient</code>, <code>patient/*.read</code>, and <code>offline_access</code>.</li>
+    <li>Access and refresh tokens are stored <strong>only on your local machine</strong> in a file named <code>tokens.json</code>. No data or tokens are uploaded to any server controlled by the app author.</li>
+    <li>FHIR data is fetched directly from the Epic FHIR server and displayed to you in the app. The app does not maintain a backend database.</li>
+    <li>To remove local data, delete the <code>tokens.json</code> file in the app folder.</li>
+  </ul>
+
+  <h2>Revoking Access</h2>
+  <p>You can revoke this app's access at any time from your MyChart account settings (look for Active App Connections / Third-Party Apps) and remove the local <code>tokens.json</code> file.</p>
+
+  <h2>Privacy</h2>
+  <ul>
+    <li>No analytics, tracking pixels, or third-party ad services are used.</li>
+    <li>Logs are kept only on your local machine during app execution.</li>
+  </ul>
+
+  <h2>Security</h2>
+  <ul>
+    <li>For OAuth redirect, the app supports HTTPS on <code>https://127.0.0.1:8765/callback</code>. If using a self-signed certificate locally, your browser may prompt you to proceed.</li>
+    <li>You are responsible for securing your local machine where tokens are stored.</li>
+  </ul>
+
+  <h2>Disclaimer</h2>
+  <p>This software is provided "as is" without warranties of any kind. It is not intended to diagnose, treat, cure, or prevent any disease and should not be relied upon for medical decision-making.</p>
+
+  <h2>Contact</h2>
+  <p>Questions or concerns? Contact: <a href="mailto:your-email@example.com">your-email@example.com</a></p>
+</body>
+</html>
