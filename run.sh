@@ -19,6 +19,12 @@ cd "$SCRIPT_DIR"
 
 SERVICE="ReadEpicData"
 
+# Provide safe defaults for optional TLS vars so set -u doesn't fail
+CERT_FILE="${CERT_FILE:-}"
+KEY_FILE="${KEY_FILE:-}"
+# Default port if not provided via environment
+PORT_VALUE="${PORT:-8765}"
+
 kc_get() {
   # $1 account name
   local account="$1"
@@ -128,7 +134,7 @@ CLIENT_ID=$CLIENT_ID
 FHIR_BASE_URL=$FHIR_BASE_URL
 REDIRECT_URI=$REDIRECT_URI
 SCOPES="$SCOPES"
-PORT=
+PORT=$PORT_VALUE
 HTTPS=$HTTPS
 CERT_FILE=$CERT_FILE
 KEY_FILE=$KEY_FILE
@@ -144,6 +150,7 @@ echo "CLIENT_ID=$CLIENT_ID"
 echo "FHIR_BASE_URL=$FHIR_BASE_URL"
 echo "REDIRECT_URI=$REDIRECT_URI"
 echo "SCOPES=$SCOPES"
+echo "PORT=$PORT_VALUE"
 if [[ "$HTTPS_FLAG" == "1" ]]; then
   echo "HTTPS=enabled (self-signed if no CERT_FILE/KEY_FILE provided)"
 fi

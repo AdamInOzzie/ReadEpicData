@@ -17,7 +17,10 @@ CLIENT_ID = os.getenv("CLIENT_ID")
 FHIR_BASE_URL = os.getenv("FHIR_BASE_URL")
 REDIRECT_URI = os.getenv("REDIRECT_URI", "http://127.0.0.1:8765/callback")
 SCOPES = os.getenv("SCOPES", "openid fhirUser launch/patient patient/*.read offline_access")
-PORT = int(os.getenv("PORT", "8765"))
+# Robust PORT parsing: handle empty string
+_port_env = os.getenv("PORT") or "8765"
+PORT = int(_port_env)
+EXPORT_DIR = os.getenv("EXPORT_DIR", os.path.join(os.getcwd(), "exports"))
 
 app = Flask(__name__)
 
@@ -37,19 +40,35 @@ class OAuthConfig:
 
 
 def smart_discover(fhir_base: str) -> OAuthConfig:
+    base = fhir_base.rstrip('/')
     # Try SMART well-known URL first
-    well_known = f"{fhir_base.rstrip('/')}/.well-known/smart-configuration"
-    r = requests.get(well_known, timeout=15)
-    if r.ok:
-        data = r.json()
+    well_known = f"{base}/.well-known/smart-configuration"
+    try:
+        r = requests.get(well_known, headers={"Accept": "application/json"}, timeout=15)
+        if r.ok:
+            data = r.json()
+            return OAuthConfig(
+                authorize_url=data["authorization_endpoint"],
+                token_url=data["token_endpoint"],
+                userinfo_url=data.get("userinfo_endpoint"),
+            )
+    except Exception:
+        # ignore and try other strategies
+        pass
+
+    # If Epic sandbox/org pattern, derive oauth2 endpoints directly
+    if ('fhir.epic.com' in base) or ('interconnect-fhir-oauth' in base):
+        # Example: https://fhir.epic.com/interconnect-fhir-oauth/api/FHIR/R4 -> root https://fhir.epic.com/interconnect-fhir-oauth
+        root = base.split('/api/')[0].rstrip('/')
         return OAuthConfig(
-            authorize_url=data["authorization_endpoint"],
-            token_url=data["token_endpoint"],
-            userinfo_url=data.get("userinfo_endpoint"),
+            authorize_url=f"{root}/oauth2/authorize",
+            token_url=f"{root}/oauth2/token",
+            userinfo_url=f"{root}/oauth2/userinfo",
         )
+
     # Fallback to metadata CapabilityStatement
-    meta = f"{fhir_base.rstrip('/')}/metadata"
-    r = requests.get(meta, headers={"Accept":"application/json"}, timeout=15)
+    meta = f"{base}/metadata"
+    r = requests.get(meta, headers={"Accept": "application/json"}, timeout=15)
     r.raise_for_status()
     cs = r.json()
     # Navigate security extensions to find OAuth URLs
@@ -67,9 +86,8 @@ def smart_discover(fhir_base: str) -> OAuthConfig:
                         authz = uri.get('valueUri')
                     if uri.get('url') == 'token':
                         token = uri.get('valueUri')
-                    if uri.get('url') == 'register' and not userinfo:
-                        # some servers include other URIs; keep placeholder
-                        pass
+                    if uri.get('url') == 'userinfo':
+                        userinfo = uri.get('valueUri')
                 if authz and token:
                     return OAuthConfig(authorize_url=authz, token_url=token, userinfo_url=userinfo)
     raise RuntimeError('Could not discover SMART OAuth endpoints from FHIR base URL')
@@ -104,7 +122,16 @@ def login():
     global oauth_config, client, code_verifier, state_param
     assert CLIENT_ID and FHIR_BASE_URL, "Set CLIENT_ID and FHIR_BASE_URL in .env"
 
-    oauth_config = smart_discover(FHIR_BASE_URL)
+    try:
+        oauth_config = smart_discover(FHIR_BASE_URL)
+    except Exception as e:
+        # Return a friendly error instead of a 500 when discovery fails (e.g., sandbox outage)
+        return jsonify({
+            'error': 'SMART discovery failed',
+            'fhir_base_url': FHIR_BASE_URL,
+            'details': str(e),
+            'hint': 'If using Epic sandbox, this may be a temporary outage. Retry later or switch to production.'
+        }), 503
 
     # PKCE setup
     code_verifier = random_string(64)
@@ -119,13 +146,24 @@ def login():
         scope=SCOPES.split()
     )
 
+    # Allow omitting aud for servers that reject it (set OMIT_AUD=1)
+    params = {
+        'code_challenge': code_challenge,
+        'code_challenge_method': 'S256',
+    }
+    if (os.getenv('OMIT_AUD', '').lower() not in ('1', 'true', 'yes')):
+        params['aud'] = FHIR_BASE_URL
+
     authorization_url, state_param = client.authorization_url(
         oauth_config.authorize_url,
-        code_challenge=code_challenge,
-        code_challenge_method='S256',
-        aud=FHIR_BASE_URL,
-        response_type='code'
+        **params
     )
+
+    # Log built URL for troubleshooting
+    try:
+        print(f"[login] authorize_url={authorization_url}")
+    except Exception:
+        pass
 
     return redirect(authorization_url)
 
@@ -139,13 +177,17 @@ def callback():
     if 'error' in request.args:
         return jsonify({'error': request.args['error'], 'description': request.args.get('error_description')}), 400
 
-    token = client.fetch_token(
-        oauth_config.token_url,
-        client_id=CLIENT_ID,
-        include_client_id=True,  # public client
-        code_verifier=code_verifier,
-        authorization_response=request.url,
-    )
+    try:
+        token = client.fetch_token(
+            oauth_config.token_url,
+            client_id=CLIENT_ID,
+            include_client_id=True,  # public client
+            code_verifier=code_verifier,
+            authorization_response=request.url,
+        )
+    except Exception as e:
+        # Surface OAuth2 exchange problems (e.g., PKCE verification failed, redirect mismatch)
+        return jsonify({'error': 'token_exchange_failed', 'details': str(e)}), 400
 
     save_tokens(token)
     return redirect('/me')
@@ -254,6 +296,99 @@ def terms():
     # Serve the local Terms & Conditions file
     return send_from_directory(os.getcwd(), 'terms.html')
 
+@app.route('/debug')
+def debug_info():
+    info = {
+        'client_id': CLIENT_ID,
+        'fhir_base_url': FHIR_BASE_URL,
+        'redirect_uri': REDIRECT_URI,
+        'scopes': SCOPES.split() if SCOPES else [],
+    }
+    try:
+        ensure_oauth_config()
+        info['oauth'] = {
+            'authorize_url': oauth_config.authorize_url if oauth_config else None,
+            'token_url': oauth_config.token_url if oauth_config else None,
+            'userinfo_url': oauth_config.userinfo_url if oauth_config else None,
+        }
+    except Exception as e:
+        info['oauth_error'] = str(e)
+    tok = load_tokens()
+    info['has_tokens'] = bool(tok)
+    if tok:
+        info['token_keys'] = sorted([k for k in tok.keys() if not k.lower().endswith('token') or k == 'id_token'])
+    return jsonify(info)
+
+def ensure_dir(path: str):
+    os.makedirs(path, exist_ok=True)
+
+
+def write_export(filename: str, data: Dict) -> str:
+    ensure_dir(EXPORT_DIR)
+    out_path = os.path.join(EXPORT_DIR, filename)
+    with open(out_path, 'w') as f:
+        json.dump(data, f, indent=2)
+    return out_path
+
+
+def fetch_everything_pages(sess: OAuth2Session, patient_id: str, max_pages: int = 10, count: int = 200):
+    pages = []
+    next_url = f"{FHIR_BASE_URL.rstrip('/')}/Patient/{patient_id}/$everything?_count={count}"
+    total_entries = 0
+    while next_url and len(pages) < max_pages:
+        r = sess.get(next_url)
+        if not r.ok:
+            break
+        bundle = r.json()
+        pages.append(bundle)
+        total_entries += len(bundle.get('entry', []))
+        # find next link
+        next_url = None
+        for link in bundle.get('link', []) or []:
+            if link.get('relation') == 'next':
+                next_url = link.get('url')
+                break
+    return pages, total_entries
+
+@app.route('/export')
+def export_data():
+    """Export patient data to a JSON file under exports/.
+    Query params:
+      - mode=sample (default) or mode=everything
+    """
+    sess = get_authed_session()
+    pid = get_patient_id(sess)
+    if not pid:
+        return jsonify({'error': 'Could not determine patient id. Login and check scopes.'}), 400
+
+    mode = (request.args.get('mode') or 'sample').lower()
+
+    from datetime import datetime
+    ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+
+    if mode == 'everything':
+        pages, total = fetch_everything_pages(sess, pid)
+        payload = {
+            'patient_id': pid,
+            'mode': 'everything',
+            'page_count': len(pages),
+            'total_entries_estimate': total,
+            'everything_pages': pages,
+        }
+        fname = f"export_everything_patient_{pid}_{ts}.json"
+        path = write_export(fname, payload)
+        return jsonify({'status': 'ok', 'mode': 'everything', 'file': path, 'page_count': len(pages), 'entries': total})
+
+    # default: sample
+    sample = {
+        'patient': sess.get(f"{FHIR_BASE_URL.rstrip('/')}/Patient/{pid}").json(),
+        'observations': sess.get(f"{FHIR_BASE_URL.rstrip('/')}/Observation?patient={pid}&_count=50&_sort=-date").json(),
+        'medication_statements': sess.get(f"{FHIR_BASE_URL.rstrip('/')}/MedicationStatement?patient={pid}&_count=200").json(),
+        'conditions': sess.get(f"{FHIR_BASE_URL.rstrip('/')}/Condition?patient={pid}&_count=200").json(),
+    }
+    fname = f"export_sample_patient_{pid}_{ts}.json"
+    path = write_export(fname, sample)
+    return jsonify({'status': 'ok', 'mode': 'sample', 'file': path})
 
 if __name__ == '__main__':
     # Optional HTTPS support for local redirect URIs that require https
@@ -267,4 +402,6 @@ if __name__ == '__main__':
         else:
             # Use Werkzeug's self-signed certificate
             ssl_context = 'adhoc'
-    app.run(host='127.0.0.1', port=PORT, debug=True, ssl_context=ssl_context)
+    # Disable debug/reloader to preserve PKCE code_verifier across /login -> /callback
+    debug_flag = (os.getenv('FLASK_DEBUG', '') or os.getenv('DEBUG', '')).lower() in ('1', 'true', 'yes')
+    app.run(host='127.0.0.1', port=PORT, debug=debug_flag, ssl_context=ssl_context, use_reloader=False)

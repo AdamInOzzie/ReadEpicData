@@ -7,3 +7,4 @@ __pycache__/
 tokens.json
 .DS_Store
 .client_ids
+certs/
