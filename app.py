@@ -11,7 +11,7 @@ from flask import Flask, jsonify, redirect, request, send_from_directory
 from requests_oauthlib import OAuth2Session
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=True)
 
 CLIENT_ID = os.getenv("CLIENT_ID")
 FHIR_BASE_URL = os.getenv("FHIR_BASE_URL")
@@ -21,6 +21,7 @@ SCOPES = os.getenv("SCOPES", "openid fhirUser launch/patient patient/*.read offl
 _port_env = os.getenv("PORT") or "8765"
 PORT = int(_port_env)
 EXPORT_DIR = os.getenv("EXPORT_DIR", os.path.join(os.getcwd(), "exports"))
+HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "20"))
 
 app = Flask(__name__)
 
@@ -171,20 +172,26 @@ def login():
 def callback():
     global oauth_config, client, code_verifier
 
-    if oauth_config is None or client is None:
+    if oauth_config is None:
         return jsonify({'error': 'OAuth session missing. Start at /login'}), 400
 
     if 'error' in request.args:
         return jsonify({'error': request.args['error'], 'description': request.args.get('error_description')}), 400
 
     try:
-        token = client.fetch_token(
+        # Create a fresh session WITHOUT scope to avoid scope-mismatch when Epic expands patient/*.read
+        session_no_scope = OAuth2Session(CLIENT_ID, redirect_uri=REDIRECT_URI)
+        token = session_no_scope.fetch_token(
             oauth_config.token_url,
             client_id=CLIENT_ID,
             include_client_id=True,  # public client
             code_verifier=code_verifier,
             authorization_response=request.url,
         )
+        try:
+            print(f"[callback] token scope: {token.get('scope')}")
+        except Exception:
+            pass
     except Exception as e:
         # Surface OAuth2 exchange problems (e.g., PKCE verification failed, redirect mismatch)
         return jsonify({'error': 'token_exchange_failed', 'details': str(e)}), 400
@@ -203,7 +210,9 @@ def ensure_oauth_config():
 def get_authed_session() -> OAuth2Session:
     ensure_oauth_config()
     tok = load_tokens()
-    assert tok, 'No tokens. Visit /login first.'
+    # Avoid AssertionError to provide cleaner HTTP responses
+    if not tok:
+        raise RuntimeError('No tokens. Visit /login first.')
     extra = {
         'client_id': CLIENT_ID,
         'include_client_id': True,
@@ -217,16 +226,19 @@ def get_userinfo(sess: OAuth2Session) -> Dict:
     ensure_oauth_config()
     # Prefer SMART well-known userinfo endpoint if available
     if oauth_config and oauth_config.userinfo_url:
-        r = sess.get(oauth_config.userinfo_url)
-        if r.ok:
-            return r.json()
+        try:
+            r = sess.get(oauth_config.userinfo_url, timeout=HTTP_TIMEOUT)
+            if r.ok:
+                return r.json()
+        except requests.exceptions.RequestException:
+            pass
     # Fallback: common pattern replacing /authorize with /userinfo
     if oauth_config and oauth_config.authorize_url and '/authorize' in oauth_config.authorize_url:
         try:
-            r = sess.get(oauth_config.authorize_url.replace('/authorize', '/userinfo'))
+            r = sess.get(oauth_config.authorize_url.replace('/authorize', '/userinfo'), timeout=HTTP_TIMEOUT)
             if r.ok:
                 return r.json()
-        except Exception:
+        except requests.exceptions.RequestException:
             pass
     # Fallback: parse id_token for fhirUser claim
     try:
@@ -244,51 +256,54 @@ def get_userinfo(sess: OAuth2Session) -> Dict:
 def get_patient_id(sess: OAuth2Session) -> Optional[str]:
     info = get_userinfo(sess)
     fhir_user = info.get('fhirUser') if isinstance(info, dict) else None
-    if fhir_user and isinstance(fhir_user, str) and fhir_user.startswith('Patient/'):
-        return fhir_user.split('/', 1)[1]
-    # Try a restricted Patient search
-    pr = sess.get(f"{FHIR_BASE_URL.rstrip('/')}/Patient").json()
-    if isinstance(pr, dict) and pr.get('entry'):
-        try:
-            return pr['entry'][0]['resource']['id']
-        except Exception:
-            return None
+    if isinstance(fhir_user, str):
+        # Handle relative reference (Patient/{id})
+        if fhir_user.startswith('Patient/'):
+            return fhir_user.split('/', 1)[1]
+        # Handle absolute URL ending with /Patient/{id}
+        if '/Patient/' in fhir_user:
+            try:
+                return fhir_user.split('/Patient/', 1)[1].split('/')[0]
+            except Exception:
+                pass
+    # Fallback to token 'patient' claim (Epic provides this)
+    try:
+        tok = load_tokens() or {}
+        pid = tok.get('patient')
+        if pid:
+            return pid
+    except Exception:
+        pass
     return None
 
 @app.route('/me')
 def me():
-    sess = get_authed_session()
+    try:
+        sess = get_authed_session()
+    except Exception:
+        return jsonify({'error': 'not_logged_in', 'details': 'No tokens. Visit /login first.'}), 401
     pid = get_patient_id(sess)
     out = { 'patient_id': pid }
     if pid:
         # Prefer instance-level $everything
-        everything = sess.get(f"{FHIR_BASE_URL.rstrip('/')}/Patient/{pid}/$everything?_count=50")
-        out['everything_status'] = everything.status_code
         try:
-            out['everything_page'] = everything.json()
-        except Exception:
-            out['everything_page'] = {'note': 'Non-JSON response'}
-        out['patient'] = sess.get(f"{FHIR_BASE_URL.rstrip('/')}/Patient/{pid}").json()
+            everything = sess.get(f"{FHIR_BASE_URL.rstrip('/')}/Patient/{pid}/$everything?_count=50", headers={'Accept': 'application/fhir+json'}, timeout=HTTP_TIMEOUT)
+            out['everything_status'] = everything.status_code
+            try:
+                out['everything_page'] = everything.json()
+            except Exception:
+                out['everything_page'] = {'note': 'Non-JSON response'}
+        except requests.exceptions.Timeout as e:
+            out['everything_status'] = 504
+            out['everything_page'] = {'error': 'timeout', 'note': str(e)}
+        except requests.exceptions.RequestException as e:
+            out['everything_status'] = 502
+            out['everything_page'] = {'error': 'request_failed', 'note': str(e)}
+        # Patient detail
+        out['patient'] = get_json_with_accept(sess, f"{FHIR_BASE_URL.rstrip('/')}/Patient/{pid}")
     else:
-        # Fallback minimal patient bundle
-        out['patient_bundle'] = sess.get(f"{FHIR_BASE_URL.rstrip('/')}/Patient").json()
+        out['note'] = 'Could not determine patient id from fhirUser/id_token.'
     out['token'] = load_tokens()
-    return jsonify(out)
-
-@app.route('/sample')
-def sample():
-    sess = get_authed_session()
-    patient_id = get_patient_id(sess)
-
-    out = {}
-    if patient_id:
-        out['patient'] = sess.get(f"{FHIR_BASE_URL.rstrip('/')}/Patient/{patient_id}").json()
-        out['observations'] = sess.get(f"{FHIR_BASE_URL.rstrip('/')}/Observation?patient={patient_id}&_count=20&_sort=-date").json()
-        out['medication_statements'] = sess.get(f"{FHIR_BASE_URL.rstrip('/')}/MedicationStatement?patient={patient_id}&_count=50").json()
-        out['conditions'] = sess.get(f"{FHIR_BASE_URL.rstrip('/')}/Condition?patient={patient_id}&_count=50").json()
-    else:
-        out['note'] = 'Could not determine patient id. Check scopes and userinfo.'
-
     return jsonify(out)
 
 @app.route('/terms')
@@ -331,24 +346,235 @@ def write_export(filename: str, data: Dict) -> str:
     return out_path
 
 
-def fetch_everything_pages(sess: OAuth2Session, patient_id: str, max_pages: int = 10, count: int = 200):
+# Helper to GET FHIR JSON with proper Accept header and safe parsing
+def get_json_with_accept(sess: OAuth2Session, url: str):
+    try:
+        r = sess.get(url, headers={'Accept': 'application/fhir+json'}, timeout=HTTP_TIMEOUT)
+    except requests.exceptions.Timeout as e:
+        return {'error': 'timeout', 'note': str(e)}
+    except requests.exceptions.RequestException as e:
+        return {'error': 'request_failed', 'note': str(e)}
+    if r.ok:
+        try:
+            return r.json()
+        except Exception:
+            # Unexpected non-JSON
+            return {'error': 'non_json_response', 'status': r.status_code, 'note': 'Expected JSON but received other content'}
+    # Non-OK HTTP
+    try:
+        body = r.json()
+    except Exception:
+        body = {'text': (r.text[:500] if getattr(r, 'text', None) else None)}
+    return {'error': 'http_error', 'status': r.status_code, 'body': body}
+
+
+# Fetch paginated results for a specific resource type for the patient
+def fetch_resource_pages(
+    sess: OAuth2Session,
+    resource_type: str,
+    patient_id: str,
+    count: int = 200,
+    max_pages: int = 5,
+    extra_params: Optional[Dict] = None,
+):
+    base = FHIR_BASE_URL.rstrip('/')
+    params = {'patient': patient_id, '_count': count}
+    if extra_params:
+        params.update(extra_params)
+    # Build URL
+    from urllib.parse import urlencode
+    next_url = f"{base}/{resource_type}?{urlencode(params)}"
+
     pages = []
-    next_url = f"{FHIR_BASE_URL.rstrip('/')}/Patient/{patient_id}/$everything?_count={count}"
     total_entries = 0
+    first_status = None
+    first_error = None
+
+    def find_next(b):
+        for link in (b.get('link') or []):
+            if link.get('relation') == 'next':
+                return link.get('url')
+        return None
+
+    # First page
+    try:
+        r = sess.get(next_url, headers={'Accept': 'application/fhir+json'}, timeout=HTTP_TIMEOUT)
+    except requests.exceptions.Timeout as e:
+        return {
+            'status': 504,
+            'error': {'error': 'timeout', 'note': str(e)},
+            'pages': pages,
+            'total_entries': total_entries,
+        }
+    except requests.exceptions.RequestException as e:
+        return {
+            'status': 502,
+            'error': {'error': 'request_failed', 'note': str(e)},
+            'pages': pages,
+            'total_entries': total_entries,
+        }
+    first_status = r.status_code
+    if not r.ok:
+        try:
+            first_error = r.json()
+        except Exception:
+            first_error = {'text': (r.text[:500] if getattr(r, 'text', None) else None)}
+        return {
+            'status': first_status,
+            'error': first_error,
+            'pages': pages,
+            'total_entries': total_entries,
+        }
+    try:
+        bundle = r.json()
+    except Exception:
+        return {
+            'status': first_status,
+            'error': {'error': 'non_json_response'},
+            'pages': pages,
+            'total_entries': total_entries,
+        }
+    pages.append(bundle)
+    total_entries += len(bundle.get('entry', []) or [])
+    next_url = find_next(bundle)
+
+    # Subsequent pages
     while next_url and len(pages) < max_pages:
-        r = sess.get(next_url)
+        try:
+            r = sess.get(next_url, headers={'Accept': 'application/fhir+json'}, timeout=HTTP_TIMEOUT)
+        except requests.exceptions.RequestException:
+            break
         if not r.ok:
             break
-        bundle = r.json()
+        try:
+            bundle = r.json()
+        except Exception:
+            break
         pages.append(bundle)
-        total_entries += len(bundle.get('entry', []))
-        # find next link
-        next_url = None
-        for link in bundle.get('link', []) or []:
+        total_entries += len(bundle.get('entry', []) or [])
+        next_url = find_next(bundle)
+
+    return {
+        'status': first_status,
+        'error': None,
+        'pages': pages,
+        'total_entries': total_entries,
+    }
+
+
+# Fallback aggregate export when $everything is not supported
+def fallback_full_export(sess: OAuth2Session, patient_id: str, count: int = 200, max_pages_per_type: int = 5):
+    # Key resource types commonly useful for a longitudinal patient view
+    specs = [
+        ('Patient', {}),  # single resource
+        ('Observation', {'_sort': '-date'}),
+        ('Condition', {}),
+        ('MedicationStatement', {}),
+        ('MedicationRequest', {}),
+        ('AllergyIntolerance', {}),
+        ('Immunization', {}),
+        ('Procedure', {}),
+        ('DiagnosticReport', {}),
+        ('DocumentReference', {}),
+        ('CarePlan', {}),
+        ('Encounter', {'_sort': '-date'}),
+    ]
+
+    results = {}
+    total_all = 0
+    errors = {}
+
+    # Patient detail (non-search)
+    base = FHIR_BASE_URL.rstrip('/')
+    patient_detail = get_json_with_accept(sess, f"{base}/Patient/{patient_id}")
+    results['Patient'] = {
+        'status': 200 if isinstance(patient_detail, dict) and 'error' not in patient_detail else patient_detail.get('status', 500),
+        'pages': [patient_detail] if isinstance(patient_detail, dict) else [],
+        'total_entries': 1 if isinstance(patient_detail, dict) and 'resourceType' in patient_detail else 0,
+    }
+    if isinstance(patient_detail, dict) and 'error' in patient_detail:
+        errors['Patient'] = patient_detail
+
+    # Search-based resources
+    for rtype, extra in specs:
+        if rtype == 'Patient':
+            continue
+        res = fetch_resource_pages(sess, rtype, patient_id, count=count, max_pages=max_pages_per_type, extra_params=extra)
+        results[rtype] = res
+        total_all += res.get('total_entries', 0)
+        if res.get('error'):
+            errors[rtype] = res['error']
+
+    summary = {
+        'resource_types': sorted(list(results.keys())),
+        'total_entries_all_resources': total_all,
+        'errors': errors,
+    }
+    return {'results': results, 'summary': summary}
+
+# Fetch Patient/$everything pages with pagination and robust error handling
+def fetch_everything_pages(sess: OAuth2Session, patient_id: str, max_pages: int = 10, count: int = 200):
+    pages = []
+    base = FHIR_BASE_URL.rstrip('/')
+    next_url = f"{base}/Patient/{patient_id}/$everything?_count={count}"
+    total_entries = 0
+    first_status = None
+    first_error_body = None
+
+    # First request
+    try:
+        r = sess.get(next_url, headers={'Accept': 'application/fhir+json'}, timeout=HTTP_TIMEOUT)
+    except requests.exceptions.Timeout as e:
+        first_status = 504
+        first_error_body = {'error': 'timeout', 'note': str(e)}
+        return pages, total_entries, first_status, first_error_body
+    except requests.exceptions.RequestException as e:
+        first_status = 502
+        first_error_body = {'error': 'request_failed', 'note': str(e)}
+        return pages, total_entries, first_status, first_error_body
+
+    first_status = r.status_code
+    if not r.ok:
+        try:
+            first_error_body = r.json()
+        except Exception:
+            first_error_body = {'text': (r.text[:500] if getattr(r, 'text', None) else None)}
+        return pages, total_entries, first_status, first_error_body
+
+    try:
+        bundle = r.json()
+    except Exception:
+        first_error_body = {'error': 'non_json_response', 'note': 'Expected JSON from $everything'}
+        return pages, total_entries, first_status, first_error_body
+
+    pages.append(bundle)
+    total_entries += len(bundle.get('entry', []) or [])
+
+    def find_next(b):
+        for link in (b.get('link') or []):
             if link.get('relation') == 'next':
-                next_url = link.get('url')
-                break
-    return pages, total_entries
+                return link.get('url')
+        return None
+
+    next_url = find_next(bundle)
+
+    # Subsequent pages
+    while next_url and len(pages) < max_pages:
+        try:
+            r = sess.get(next_url, headers={'Accept': 'application/fhir+json'}, timeout=HTTP_TIMEOUT)
+        except requests.exceptions.RequestException:
+            break
+        if not r.ok:
+            break
+        try:
+            bundle = r.json()
+        except Exception:
+            break
+        pages.append(bundle)
+        total_entries += len(bundle.get('entry', []) or [])
+        next_url = find_next(bundle)
+
+    return pages, total_entries, first_status, None
 
 @app.route('/export')
 def export_data():
@@ -356,10 +582,13 @@ def export_data():
     Query params:
       - mode=sample (default) or mode=everything
     """
-    sess = get_authed_session()
+    try:
+        sess = get_authed_session()
+    except Exception:
+        return jsonify({'error': 'not_logged_in', 'details': 'No tokens. Visit /login first.'}), 401
     pid = get_patient_id(sess)
     if not pid:
-        return jsonify({'error': 'Could not determine patient id. Login and check scopes.'}), 400
+        return jsonify({'error': 'invalid_state', 'details': 'Could not determine patient id. Login and check scopes.'}), 400
 
     mode = (request.args.get('mode') or 'sample').lower()
 
@@ -367,7 +596,24 @@ def export_data():
     ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
 
     if mode == 'everything':
-        pages, total = fetch_everything_pages(sess, pid)
+        pages, total, first_status, first_error = fetch_everything_pages(sess, pid)
+        if first_status and first_status == 404:
+            # Fallback: aggregate key resources with pagination
+            fb = fallback_full_export(sess, pid)
+            payload = {
+                'patient_id': pid,
+                'mode': 'everything_fallback',
+                'fallback': fb,
+            }
+            fname = f"export_full_fallback_patient_{pid}_{ts}.json"
+            path = write_export(fname, payload)
+            return jsonify({'status': 'ok', 'mode': 'everything_fallback', 'file': path, 'resource_types': len(fb['summary']['resource_types']), 'entries': fb['summary']['total_entries_all_resources'], 'errors': fb['summary']['errors']})
+        if first_status and first_status >= 400:
+            return jsonify({
+                'error': 'everything_failed',
+                'status': first_status,
+                'details': first_error or {},
+            }), 502
         payload = {
             'patient_id': pid,
             'mode': 'everything',
@@ -380,11 +626,15 @@ def export_data():
         return jsonify({'status': 'ok', 'mode': 'everything', 'file': path, 'page_count': len(pages), 'entries': total})
 
     # default: sample
+    if mode != 'sample':
+        return jsonify({'error': 'bad_request', 'details': f'Unknown mode={mode}. Use sample or everything.'}), 400
+
+    base = FHIR_BASE_URL.rstrip('/')
     sample = {
-        'patient': sess.get(f"{FHIR_BASE_URL.rstrip('/')}/Patient/{pid}").json(),
-        'observations': sess.get(f"{FHIR_BASE_URL.rstrip('/')}/Observation?patient={pid}&_count=50&_sort=-date").json(),
-        'medication_statements': sess.get(f"{FHIR_BASE_URL.rstrip('/')}/MedicationStatement?patient={pid}&_count=200").json(),
-        'conditions': sess.get(f"{FHIR_BASE_URL.rstrip('/')}/Condition?patient={pid}&_count=200").json(),
+        'patient': get_json_with_accept(sess, f"{base}/Patient/{pid}"),
+        'observations': get_json_with_accept(sess, f"{base}/Observation?patient={pid}&_count=50&_sort=-date"),
+        'medication_statements': get_json_with_accept(sess, f"{base}/MedicationStatement?patient={pid}&_count=200"),
+        'conditions': get_json_with_accept(sess, f"{base}/Condition?patient={pid}&_count=200"),
     }
     fname = f"export_sample_patient_{pid}_{ts}.json"
     path = write_export(fname, sample)
